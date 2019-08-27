@@ -53,6 +53,7 @@
 #include <boost/program_options.hpp>
 #include <boost/thread/barrier.hpp>
 #include <boost/container/static_vector.hpp>
+#include <boost/range/adaptor/filtered.hpp>
 #include <set>
 #include <seastar/core/linux-aio.hh>
 #include <seastar/util/eclipse.hh>
@@ -528,6 +529,7 @@ private:
         uint64_t _tasks_processed = 0;
         circular_buffer<std::unique_ptr<task>> _q;
         sstring _name;
+        std::vector<void*> _schduling_group_specific_vals;
         int64_t to_vruntime(sched_clock::duration runtime) const;
         void set_shares(float shares);
         struct indirect_compare;
@@ -538,6 +540,7 @@ private:
         void register_stats();
     };
     boost::container::static_vector<std::unique_ptr<task_queue>, max_scheduling_groups()> _task_queues;
+    std::vector<scheduling_group_key_config> _scheduling_group_key_configs;
     int64_t _last_vruntime = 0;
     task_queue_list _active_task_queues;
     task_queue_list _activating_task_queues;
@@ -642,8 +645,11 @@ private:
     void insert_activating_task_queues();
     void account_runtime(task_queue& tq, sched_clock::duration runtime);
     void account_idle(sched_clock::duration idletime);
-    void init_scheduling_group(scheduling_group sg, sstring name, float shares);
-    void destroy_scheduling_group(scheduling_group sg);
+    future<> init_scheduling_group(scheduling_group sg, sstring name, float shares);
+    future<> init_new_scheduling_group_key(scheduling_group_key key, scheduling_group_key_config cfg);
+    future<> destroy_scheduling_group(scheduling_group sg);
+    void* get_scheduling_group_specific_value(scheduling_group sg, scheduling_group_key key);
+    void* get_scheduling_group_specific_value(scheduling_group_key key);
     uint64_t tasks_processed() const;
     uint64_t min_vruntime() const;
     void request_preemption();
@@ -867,6 +873,18 @@ private:
     friend future<scheduling_group> create_scheduling_group(sstring name, float shares);
     friend future<> seastar::destroy_scheduling_group(scheduling_group);
     friend future<> seastar::rename_scheduling_group(scheduling_group sg, sstring new_name);
+    friend future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg);
+
+    template<typename T>
+    friend T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key);
+    template<typename T>
+    friend T& scheduling_group_get_specific(scheduling_group_key key);
+    template<typename SpecificValType, typename Mapper, typename Reducer, typename Initial>
+    future<typename function_traits<Reducer>::return_type>
+        friend map_reduce_sg_specific(Mapper mapper, Reducer reducer, Initial initial_val, scheduling_group_key key);
+    template<typename SpecificValType, typename Reducer, typename Initial>
+        friend future<typename function_traits<Reducer>::return_type>
+    reduce_sg_specific(Reducer reducer, Initial initial_val, scheduling_group_key key);
 public:
     bool wait_and_process(int timeout = 0, const sigset_t* active_sigmask = nullptr);
     future<> readable(pollable_fd_state& fd);
@@ -1057,6 +1075,40 @@ size_t iovec_len(const iovec* begin, size_t len)
 }
 
 extern logger seastar_logger;
+
+template<typename T>
+T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key) {
+    return *reinterpret_cast<T*>(engine().get_scheduling_group_specific_value(sg, key));
+}
+
+template<typename T>
+T& scheduling_group_get_specific(scheduling_group_key key) {
+    return *reinterpret_cast<T*>(engine().get_scheduling_group_specific_value(key));
+}
+
+template<typename SpecificValType, typename Mapper, typename Reducer, typename Initial>
+future<typename function_traits<Reducer>::return_type>
+map_reduce_sg_specific(Mapper mapper, Reducer reducer,
+        Initial initial_val, scheduling_group_key key) {
+    auto wrapped_maper = [key, mapper] (std::unique_ptr<reactor::task_queue>& tq) {
+        return make_ready_future<typename function_traits<Mapper>::return_type>
+            (mapper(scheduling_group(tq->_id).get_specific<SpecificValType>(key)));
+    };
+    return map_reduce(engine()._task_queues|boost::adaptors::filtered([] (std::unique_ptr<reactor::task_queue>& tq) {
+            return bool(tq);}), wrapped_maper, initial_val, reducer);
+}
+
+template<typename SpecificValType, typename Reducer, typename Initial>
+future<typename function_traits<Reducer>::return_type>
+reduce_sg_specific(Reducer reducer, Initial initial_val, scheduling_group_key key) {
+    auto maper = [key] (std::unique_ptr<reactor::task_queue>& tq) {
+        return make_ready_future<SpecificValType>(scheduling_group(tq->_id).get_specific<SpecificValType>(key));
+    };
+
+    return map_reduce(engine()._task_queues|boost::adaptors::filtered([] (std::unique_ptr<reactor::task_queue>& tq) {
+            return bool(tq);}), maper, initial_val, reducer);
+}
+
 
 }
 

@@ -1464,6 +1464,23 @@ reactor::~reactor() {
     eraser(_expired_lowres_timers);
     eraser(_expired_manual_timers);
     io_destroy(_io_context);
+    for (auto&& tq : _task_queues) {
+        if (tq) {
+            // The following line will preserve the convention that constructor and destructor functions
+            // for the per sg values are called in the context of the containing scheduling group.
+            *internal::current_scheduling_group_ptr() = scheduling_group(tq->_id);
+            for(size_t key : boost::irange<size_t>(0, _scheduling_group_key_configs.size())) {
+                void* val = tq->_schduling_group_specific_vals[key];
+                if (val) {
+                    if (_scheduling_group_key_configs[key].destructor) {
+                        _scheduling_group_key_configs[key].destructor(val);
+                    }
+                    free(val);
+                    tq->_schduling_group_specific_vals[key] = nullptr;
+                }
+            }
+        }
+    }
 }
 
 bool reactor::wait_and_process(int timeout, const sigset_t* active_sigmask) {
@@ -6082,6 +6099,7 @@ std::chrono::nanoseconds reactor::total_steal_time() {
 }
 
 static std::atomic<unsigned long> s_used_scheduling_group_ids_bitmap{3}; // 0=main, 1=atexit
+static std::atomic<unsigned long> s_next_scheduling_group_specific_key{0};
 
 static
 unsigned
@@ -6101,21 +6119,97 @@ allocate_scheduling_group_id() {
 }
 
 static
+unsigned
+allocate_scheduling_group_specific_key() {
+    auto key = s_next_scheduling_group_specific_key.load(std::memory_order_relaxed);
+    auto next_key = key + 1;
+    while (!s_next_scheduling_group_specific_key.compare_exchange_weak(key, next_key, std::memory_order_relaxed)) {
+        next_key = key + 1;
+    }
+    return key;
+}
+
+static
 void
 deallocate_scheduling_group_id(unsigned id) {
     s_used_scheduling_group_ids_bitmap.fetch_and(~(1ul << id), std::memory_order_relaxed);
 }
 
-void
+future<>
 reactor::init_scheduling_group(seastar::scheduling_group sg, sstring name, float shares) {
     _task_queues.resize(std::max<size_t>(_task_queues.size(), sg._id + 1));
     _task_queues[sg._id] = std::make_unique<task_queue>(sg._id, name, shares);
+    scheduling_group_key num_keys = s_next_scheduling_group_specific_key.load(std::memory_order_relaxed);
+    if (num_keys) {
+        return with_scheduling_group(sg, [this, num_keys, id = sg._id] () {
+            _task_queues[id]->_schduling_group_specific_vals.resize(num_keys);
+            parallel_for_each(boost::irange<scheduling_group_key>(scheduling_group_key(0), num_keys),
+                   [this, id] (scheduling_group_key key) {
+               _task_queues[id]->_schduling_group_specific_vals[key] =
+                       aligned_alloc(_scheduling_group_key_configs[key].alignment,
+                       _scheduling_group_key_configs[key].allocation_size);
+               if(_scheduling_group_key_configs[key].constructor) {
+                   _scheduling_group_key_configs[key].constructor(_task_queues[id]->_schduling_group_specific_vals[key]);
+               }
+               return make_ready_future();
+           });
+        });
+    } else {
+        return make_ready_future();
+    }
+
 }
 
-void
-reactor::destroy_scheduling_group(scheduling_group sg) {
-    _task_queues[sg._id].reset();
+future<>
+reactor::init_new_scheduling_group_key(scheduling_group_key key, scheduling_group_key_config cfg) {
+    _scheduling_group_key_configs.resize(std::max<size_t>(_scheduling_group_key_configs.size(), key+1));
+    _scheduling_group_key_configs[key] = cfg;
+    return parallel_for_each(_task_queues, [this, cfg, key] (std::unique_ptr<task_queue>& tq) {
+        if (tq) {
+            return with_scheduling_group(scheduling_group(tq->_id), [this, key, &tq] () {
+                tq->_schduling_group_specific_vals.resize(std::max<size_t>(tq->_schduling_group_specific_vals.size(), key+1));
+                tq->_schduling_group_specific_vals[key] = aligned_alloc(_scheduling_group_key_configs[key].alignment,
+                        _scheduling_group_key_configs[key].allocation_size);
+                if(_scheduling_group_key_configs[key].constructor) {
+                    _scheduling_group_key_configs[key].constructor(tq->_schduling_group_specific_vals[key]);
+                }
+            });
+        }
+        return make_ready_future();
+    });
 }
+
+future<>
+reactor::destroy_scheduling_group(scheduling_group sg) {
+    return with_scheduling_group(sg, [this, sg] () {
+        return parallel_for_each(boost::irange<size_t>(0, _scheduling_group_key_configs.size()), [this, sg] (size_t key) {
+            void* val = _task_queues[sg._id]->_schduling_group_specific_vals[key];
+            if (val) {
+                if (_scheduling_group_key_configs[key].destructor) {
+                    _scheduling_group_key_configs[key].destructor(val);
+                }
+                free(val);
+                _task_queues[sg._id]->_schduling_group_specific_vals[key] = nullptr;
+            }
+            return make_ready_future();
+        });
+    }).then( [this, sg] () {
+        _task_queues[sg._id].reset();
+    });
+
+}
+
+void* reactor::get_scheduling_group_specific_value(scheduling_group sg, scheduling_group_key key) {
+    if(!_task_queues[sg._id]) {
+        throw std::invalid_argument(format("The scheduling group does not exist ({})", sg._id));
+    }
+    return _task_queues[sg._id]->_schduling_group_specific_vals[key];
+}
+
+void* reactor::get_scheduling_group_specific_value(scheduling_group_key key) {
+    return get_scheduling_group_specific_value(*internal::current_scheduling_group_ptr(), key);
+}
+
 
 const sstring&
 scheduling_group::name() const {
@@ -6133,9 +6227,19 @@ create_scheduling_group(sstring name, float shares) {
     assert(id < max_scheduling_groups());
     auto sg = scheduling_group(id);
     return smp::invoke_on_all([sg, name, shares] {
-        engine().init_scheduling_group(sg, name, shares);
+        return engine().init_scheduling_group(sg, name, shares);
     }).then([sg] {
         return make_ready_future<scheduling_group>(sg);
+    });
+}
+
+future<scheduling_group_key>
+scheduling_group_key_create(scheduling_group_key_config cfg) {
+    scheduling_group_key key = allocate_scheduling_group_specific_key();
+    return smp::invoke_on_all([key, cfg] {
+        return engine().init_new_scheduling_group_key(key, cfg);
+    }).then([key] {
+        return make_ready_future<scheduling_group_key>(key);
     });
 }
 

@@ -22,6 +22,7 @@
 #pragma once
 
 #include <seastar/core/sstring.hh>
+#include <seastar/core/function_traits.hh>
 
 /// \file
 
@@ -80,6 +81,78 @@ future<> destroy_scheduling_group(scheduling_group sg);
 /// \return a future that is ready when the scheduling group has been renamed
 future<> rename_scheduling_group(scheduling_group sg, sstring new_name);
 
+using scheduling_group_key = unsigned long;
+
+struct scheduling_group_key_config {
+    size_t allocation_size;
+    size_t alignment;
+    std::function<void (void*)> constructor;
+    std::function<void (void*)> destructor;
+};
+
+template <typename T, typename... ConstructorArgs, std::enable_if_t<std::negation_v<std::is_scalar<T>>, int> = 0 >
+scheduling_group_key_config
+make_scheduling_group_key_config(ConstructorArgs... args) {
+    scheduling_group_key_config sgkc;
+    sgkc.allocation_size = sizeof(T);
+    sgkc.alignment = alignof(T);
+    sgkc.constructor = [args = std::make_tuple(args...)] (void* p) {
+
+         new (p) T(std::make_from_tuple<T>(args));
+    };
+    sgkc.destructor = [] (void* p) {
+
+        static_cast<T*>(p)->~T();
+    };
+    return sgkc;
+}
+
+template <typename T, std::enable_if_t<std::negation_v<std::is_scalar<T>>, int> = 0 >
+scheduling_group_key_config
+make_scheduling_group_key_config() {
+    scheduling_group_key_config sgkc;
+    sgkc.allocation_size = sizeof(T);
+    sgkc.alignment = alignof(T);
+    sgkc.constructor = [] (void* p) {
+
+         new (p) T();
+    };
+    sgkc.destructor = [] (void* p) {
+
+        static_cast<T*>(p)->~T();
+    };
+    return sgkc;
+}
+
+template <typename T, typename InitialVal, std::enable_if_t<std::is_scalar_v<T>, int> = 0 >
+scheduling_group_key_config
+make_scheduling_group_key_config(InitialVal initial_val) {
+    scheduling_group_key_config sgkc;
+    sgkc.allocation_size = sizeof(T);
+    sgkc.alignment = alignof(T);
+    sgkc.constructor = [initial_val] (void* p) {
+        (T)(*p) = initial_val;
+    };
+    return sgkc;
+}
+
+template <typename T, std::enable_if_t<std::is_scalar_v<T>, int> = 0 >
+scheduling_group_key_config
+make_scheduling_group_key_config() {
+    scheduling_group_key_config sgkc;
+    sgkc.allocation_size = sizeof(T);
+    sgkc.alignment = alignof(T);
+    sgkc.constructor = [] (void* p) {
+        memset(p, 0, sizeof(T));
+    };
+    return sgkc;
+}
+
+future<scheduling_group_key> scheduling_group_key_create(scheduling_group_key_config cfg);
+
+template<typename T>
+T& scheduling_group_get_specific(scheduling_group sg, scheduling_group_key key);
+
 /// \brief Identifies function calls that are accounted as a group
 ///
 /// A `scheduling_group` is a tag that can be used to mark a function call.
@@ -96,6 +169,10 @@ public:
     bool operator==(scheduling_group x) const { return _id == x._id; }
     bool operator!=(scheduling_group x) const { return _id != x._id; }
     bool is_main() const { return _id == 0; }
+    template<typename T>
+    T& get_specific(scheduling_group_key key) {
+        return scheduling_group_get_specific<T>(*this, key);
+    }
     /// Adjusts the number of shares allotted to the group.
     ///
     /// Dynamically adjust the number of shares allotted to the group, increasing or
@@ -115,6 +192,14 @@ public:
     friend class reactor;
     friend unsigned internal::scheduling_group_index(scheduling_group sg);
     friend scheduling_group internal::scheduling_group_from_index(unsigned index);
+    template<typename SpecificValType, typename Mapper, typename Reducer, typename Initial>
+    friend future<typename function_traits<Reducer>::return_type>
+        map_reduce_sg_specific(Mapper mapper, Reducer reducer, Initial initial_val, scheduling_group_key key);
+    template<typename SpecificValType, typename Reducer, typename Initial>
+    friend future<typename function_traits<Reducer>::return_type>
+        reduce_sg_specific(Reducer reducer, Initial initial_val, scheduling_group_key key);
+
+
 };
 
 /// \cond internal
